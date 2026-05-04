@@ -23,6 +23,7 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import urlparse
 
+import questionary
 import typer
 from rich.console import Console
 from rich.panel import Panel
@@ -97,7 +98,7 @@ DEFAULT_SELECTED_MODELS = {
 USAGE_BREAKDOWN_DAYS = 7
 USAGE_SUMMARY_DAYS = 30
 BUNDLE_VERSION = 1
-MANAGED_FILE_HEADER = "# Managed by coding-gateway. Run `coding-gateway logout` to restore the prior config.\n"
+MANAGED_FILE_HEADER = "# Managed by coding-gateway. Run `coding-gateway revert` to restore the prior config.\n"
 
 _dry_run = False
 
@@ -439,6 +440,15 @@ def has_valid_databricks_auth(workspace: str) -> bool:
         return False
 
 
+def find_profile_name_for_host(workspace: str) -> str | None:
+    """Find the Databricks CLI profile name matching a workspace URL."""
+    normalized = workspace.rstrip("/")
+    for host, name in get_databricks_profiles():
+        if host == normalized:
+            return name
+    return None
+
+
 def ensure_databricks_auth(workspace: str) -> None:
     with spinner("Checking Databricks auth..."):
         auth_is_valid = has_valid_databricks_auth(workspace)
@@ -450,8 +460,12 @@ def ensure_databricks_auth(workspace: str) -> None:
     print_kv("Workspace", workspace)
     print_note("A browser may open for `databricks auth login`.")
     try:
+        cmd = ["databricks", "auth", "login", "--host", workspace]
+        profile_name = find_profile_name_for_host(workspace)
+        if profile_name:
+            cmd += ["--profile", profile_name]
         run(
-            ["databricks", "auth", "login", "--host", workspace],
+            cmd,
             env=build_databricks_cli_env(workspace),
             timeout=300,
         )
@@ -950,179 +964,6 @@ def build_shared_base_urls(
     }
 
 
-def classify_tool_from_text(text: str) -> str | None:
-    value_lower = text.lower()
-    if "claude" in value_lower or "anthropic" in value_lower:
-        return "claude"
-    if "gemini" in value_lower:
-        return "gemini"
-    if (
-        "gpt" in value_lower
-        or "openai" in value_lower
-        or "codex" in value_lower
-        or " o1" in f" {value_lower}"
-        or " o3" in f" {value_lower}"
-        or " o4" in f" {value_lower}"
-    ):
-        return "codex"
-    return None
-
-
-def is_supported_databricks_model_name(name: str) -> bool:
-    normalized = name.strip().lower()
-    return normalized.startswith("databricks-") and "oss" not in normalized
-
-
-def run_databricks_json(
-    args: list[str],
-    workspace: str,
-    *,
-    timeout: int = 30,
-) -> dict | list:
-    env = build_databricks_cli_env(workspace)
-    result = run(
-        ["databricks", *args, "-o", "json"],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=timeout,
-    )
-    if result.returncode != 0:
-        error_text_raw = (result.stderr or result.stdout or "").strip()
-        first_line = error_text_raw.splitlines()[0] if error_text_raw else "unknown error"
-        raise RuntimeError(f"Databricks CLI command failed: {first_line}")
-
-    try:
-        return json.loads(result.stdout or "{}")
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Databricks CLI returned invalid JSON output.") from exc
-
-
-def extract_model_like_strings(payload: object) -> set[str]:
-    names: set[str] = set()
-
-    def walk(node: object) -> None:
-        if isinstance(node, dict):
-            for key, value_obj in node.items():
-                if isinstance(value_obj, str):
-                    key_lower = key.lower()
-                    if (
-                        "model" in key_lower
-                        or "entity" in key_lower
-                        or key_lower in {"name", "provider"}
-                    ):
-                        value_clean = value_obj.strip()
-                        if value_clean:
-                            names.add(value_clean)
-                else:
-                    walk(value_obj)
-        elif isinstance(node, list):
-            for item in node:
-                walk(item)
-
-    walk(payload)
-    return names
-
-
-def discover_workspace_models(workspace: str) -> dict[str, set[str]]:
-    grouped_models: dict[str, set[str]] = {
-        "codex": set(),
-        "claude": set(),
-        "gemini": set(),
-    }
-
-    list_payload = run_databricks_json(["serving-endpoints", "list"], workspace)
-
-    for candidate in extract_model_like_strings(list_payload):
-        if not is_supported_databricks_model_name(candidate):
-            continue
-        tool = classify_tool_from_text(candidate)
-        if tool:
-            grouped_models[tool].add(candidate)
-
-    return grouped_models
-
-
-def prompt_for_model_choice(tool: str, models: list[str]) -> str:
-    if not models:
-        raise RuntimeError(
-            f"No {TOOL_SPECS[tool]['display']} models were discovered in the workspace."
-        )
-
-    print_section(f"{TOOL_SPECS[tool]['display']} Models")
-    print_note("Choose the model to launch with.")
-    for index, model_name in enumerate(models, start=1):
-        console.print(f"  [bold]{index}.[/bold] [cyan]{model_name}[/cyan]")
-
-    while True:
-        raw_value = console.input(f"{label('Select model')} {muted('›')} ").strip()
-        if not raw_value:
-            print_err("Please enter a model number.")
-            continue
-        if raw_value.isdigit():
-            selected_index = int(raw_value)
-            if 1 <= selected_index <= len(models):
-                return models[selected_index - 1]
-        print_err("Please enter a valid model number from the list.")
-
-
-def prompt_for_model_value(tool: str) -> str:
-    while True:
-        model_name = console.input(
-            f"{label(f'{TOOL_SPECS[tool]['display']} model')} {muted('›')} "
-        ).strip()
-        if model_name:
-            return model_name
-        print_err("Model cannot be empty.")
-
-
-def resolve_selected_model(
-    tool: str,
-    state: dict,
-    explicit_model: str | None,
-    *,
-    prefer_saved: bool = True,
-) -> tuple[dict, str | None]:
-    if tool == "codex":
-        return state, None
-
-    selected_models = dict(state.get("selected_models") or {})
-    if explicit_model:
-        selected_models[tool] = explicit_model
-        state["selected_models"] = selected_models
-        save_state(state)
-        return state, explicit_model
-
-    existing_model = selected_models.get(tool)
-    if prefer_saved and existing_model:
-        return state, existing_model
-
-    workspace = state.get("workspace")
-    if not workspace:
-        raise RuntimeError("Workspace is not configured.")
-
-    try:
-        with spinner(f"Loading {TOOL_SPECS[tool]['display']} models from workspace..."):
-            grouped_models = discover_workspace_models(workspace)
-        available_models = sorted(grouped_models.get(tool, set()))
-    except RuntimeError as exc:
-        available_models = []
-        print_section(f"{TOOL_SPECS[tool]['display']} Models")
-        print_warning(f"Automatic model discovery failed: {exc}")
-        print_note("Enter the model name manually.")
-
-    if available_models:
-        selected_model = prompt_for_model_choice(tool, available_models)
-    else:
-        print_section(f"{TOOL_SPECS[tool]['display']} Model")
-        print_note("No models were discovered automatically. Enter the model name manually.")
-        selected_model = prompt_for_model_value(tool)
-
-    selected_models[tool] = selected_model
-    state["selected_models"] = selected_models
-    save_state(state)
-    return state, selected_model
 
 
 def resolve_launch_model(
@@ -1231,9 +1072,53 @@ def build_gemini_runtime_env(
     return env
 
 
+def get_databricks_profiles() -> list[tuple[str, str]]:
+    """Return [(host_url, profile_name), ...] from Databricks CLI profiles."""
+    try:
+        result = run(
+            ["databricks", "auth", "profiles", "--output", "json"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return []
+        data = json.loads(result.stdout or "{}")
+        profiles = data.get("profiles") or []
+        seen: set[str] = set()
+        result = []
+        for p in profiles:
+            host = p.get("host", "").rstrip("/")
+            if host and host not in seen and p.get("auth_type") != "pat":
+                seen.add(host)
+                result.append((host, p["name"]))
+        return result
+    except (json.JSONDecodeError, OSError, subprocess.TimeoutExpired, KeyError):
+        return []
+
+
 def prompt_for_workspace(description: str = "Enter your Databricks workspace URL") -> str:
     console.print()
     console.print(Panel(description, title="coding-gateway Setup", style="bold blue", expand=False))
+
+    profiles = get_databricks_profiles()
+    if profiles:
+        choices = [
+            questionary.Choice(title=host, value=host)
+            for host, name in profiles
+        ]
+        choices.append(questionary.Choice(title="Enter a different URL", value="__manual__"))
+        style = questionary.Style([
+            ("highlighted", "fg:cyan bold"),
+            ("pointer", "fg:cyan bold"),
+            ("answer", "fg:cyan"),
+        ])
+        choice = questionary.select(
+            "Select workspace:", choices=choices, style=style, pointer="›", qmark=""
+        ).ask()
+        if choice is not None and choice != "__manual__":
+            return normalize_workspace_url(choice)
+
     while True:
         raw_value = console.input(f"  [bold]Workspace URL[/bold] {muted('›')} ").strip()
         try:
@@ -1415,12 +1300,55 @@ def configure_tool(tool: str, state: dict, model: str | None = None) -> dict:
     raise RuntimeError(f"Unsupported tool '{tool}'.")
 
 
+def check_gateway_endpoint(workspace: str, token: str, tool: str, use_ai_gateway_v2: bool) -> bool:
+    """Check if a tool's AI Gateway endpoint is reachable."""
+    base_url = build_tool_base_url(tool, workspace, use_ai_gateway_v2)
+    hostname = workspace_hostname(workspace)
+    if tool == "claude":
+        url = f"https://{hostname}/ai-gateway/anthropic/v1/messages" if use_ai_gateway_v2 else f"{base_url}/v1/messages"
+    elif tool == "codex":
+        url = f"{base_url}/responses"
+    elif tool == "gemini":
+        url = f"{base_url}/v1beta/models"
+    else:
+        return False
+    req = urllib_request.Request(url, method="HEAD", headers={"Authorization": f"Bearer {token}"})
+    try:
+        urllib_request.urlopen(req, timeout=10)
+        return True
+    except urllib_error.HTTPError as exc:
+        return exc.code in (400, 401, 405, 422)
+    except (urllib_error.URLError, OSError):
+        return False
+
+
 def configure_all_tools(state: dict) -> dict:
-    state = configure_tool("codex", state, None)
-    state, claude_model = resolve_launch_model("claude", state, None)
-    state = configure_tool("claude", state, claude_model)
-    state, gemini_model = resolve_launch_model("gemini", state, None)
-    state = configure_tool("gemini", state, gemini_model)
+    workspace = state["workspace"]
+    token = get_databricks_token(workspace)
+    use_ai_gateway_v2 = bool(state.get("use_ai_gateway_v2"))
+    available_tools: list[str] = []
+    unavailable_tools: list[str] = []
+
+    for tool in TOOL_SPECS:
+        with spinner(f"Checking {TOOL_SPECS[tool]['display']} availability..."):
+            ok = check_gateway_endpoint(workspace, token, tool, use_ai_gateway_v2)
+        if ok:
+            available_tools.append(tool)
+        else:
+            unavailable_tools.append(tool)
+
+    for tool in unavailable_tools:
+        print_err(f"{TOOL_SPECS[tool]['display']} is not available on this workspace")
+
+    for tool in available_tools:
+        if tool == "codex":
+            state = configure_tool("codex", state, None)
+        else:
+            state, model = resolve_launch_model(tool, state, None)
+            state = configure_tool(tool, state, model)
+
+    state["available_tools"] = available_tools
+    save_state(state)
     return state
 
 
@@ -1435,6 +1363,64 @@ def ensure_provider_state(tool: str) -> dict:
     return configure_shared_state(workspace)
 
 
+def validate_tool(tool: str) -> tuple[bool, str]:
+    """Invoke a tool with a simple prompt to verify it works. Returns (ok, error_msg)."""
+    spec = TOOL_SPECS[tool]
+    binary = spec["binary"]
+    if tool == "claude":
+        cmd = [binary, "-p", "say hi in 5 words or less", "--max-turns", "1"]
+    elif tool == "codex":
+        cmd = [binary, "exec", "say hi in 5 words or less"]
+    elif tool == "gemini":
+        cmd = [binary, "-p", "say hi in 5 words or less"]
+    else:
+        return False, "unsupported tool"
+    try:
+        result = run(cmd, check=False, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0:
+            return True, ""
+        output = (result.stderr or result.stdout or "").strip()
+        for line in output.splitlines():
+            if "error" in line.lower() and ("message" in line.lower() or ":" in line):
+                msg = line.strip()
+                if "error_code" in msg:
+                    try:
+                        payload = json.loads(msg[msg.index("{"):msg.rindex("}") + 1])
+                        return False, payload.get("message", msg)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                return False, msg
+        last_line = output.splitlines()[-1] if output else "unknown error"
+        return False, last_line
+    except OSError as exc:
+        return False, str(exc)
+    except subprocess.TimeoutExpired:
+        return False, "timed out"
+
+
+def validate_all_tools(state: dict) -> None:
+    console.print()
+    console.print(Panel("Testing each tool with a quick message...", title="Validating", style="bold blue", expand=False))
+    results: list[tuple[str, bool]] = []
+    for tool, spec in TOOL_SPECS.items():
+        with spinner(f"Validating {spec['display']}..."):
+            ok, err = validate_tool(tool)
+        results.append((tool, ok))
+        if ok:
+            print_success(f"{spec['display']} is working")
+        else:
+            print_err(f"{spec['display']}: {err}")
+
+    console.print()
+    success_tools = [(t, s) for t, s in results if s]
+    if success_tools:
+        lines = []
+        for tool, _ in success_tools:
+            spec = TOOL_SPECS[tool]
+            lines.append(f"[green]✓[/green] [bold]{spec['display']}[/bold] — run with [cyan]coding-gateway --agent {tool}[/cyan]")
+        console.print(Panel("\n".join(lines), title="Ready", style="green", expand=False))
+
+
 def configure_workspace_command() -> int:
     workspace = prompt_for_configuration()
     state = configure_shared_state(workspace)
@@ -1445,38 +1431,22 @@ def configure_workspace_command() -> int:
         if state.get("use_ai_gateway_v2")
         else "Workspace serving endpoint"
     )
+    available_tools = state.get("available_tools") or []
     summary_lines = [
         f"[bold]Workspace:[/bold] [cyan]{state['workspace']}[/cyan]",
         f"[bold]Mode:[/bold] [cyan]{mode}[/cyan]",
     ]
-    for spec in TOOL_SPECS.values():
-        summary_lines.append(f"[bold]{spec['display']}:[/bold] [green]configured[/green]")
+    for tool, spec in TOOL_SPECS.items():
+        if tool in available_tools:
+            summary_lines.append(f"[bold]{spec['display']}:[/bold] [green]configured[/green]")
+        else:
+            summary_lines.append(f"[bold]{spec['display']}:[/bold] [dim]not available[/dim]")
     console.print(Panel("\n".join(summary_lines), title="Configuration Complete", style="green", expand=False))
+
+    if available_tools:
+        validate_all_tools(state)
     return 0
 
-
-def configure_model_for_tool(tool: str, model: str | None) -> int:
-    if tool == "codex":
-        raise RuntimeError("Codex model selection is handled inside Codex itself.")
-
-    state = ensure_provider_state(tool)
-    state, resolved_model = resolve_selected_model(
-        tool,
-        state,
-        model,
-        prefer_saved=False,
-    )
-    state = configure_tool(tool, state, resolved_model)
-
-    print_heading("Configured")
-    print_kv("Tool", TOOL_SPECS[tool]["display"])
-    print_kv("Workspace", state["workspace"])
-    print_kv("Model", resolved_model or "not selected")
-    print_kv("Base URL", state["base_urls"][tool])
-    print_kv("Config file", str(TOOL_SPECS[tool]["config_path"]))
-    print_success(f"{TOOL_SPECS[tool]['display']} model configuration saved")
-    print_note(f"Launch via `coding-gateway --tool {tool}`.")
-    return 0
 
 
 def build_mcp_http_entry(url: str, client_id: str, callback_port: int = 8080) -> dict:
@@ -1743,11 +1713,11 @@ def status() -> int:
     print_kv("State file", str(STATE_PATH) if STATE_PATH.exists() else "missing")
     print_note("Use `coding-gateway configure` to update workspace settings or tool models.")
     print_note("Use `coding-gateway configure mcp` to add Databricks MCP servers to Claude Code.")
-    print_note("Use `coding-gateway logout` to clear managed configs and restore prior files.")
+    print_note("Use `coding-gateway revert` to clear managed configs and restore prior files.")
     return 0
 
 
-def logout() -> int:
+def revert() -> int:
     state = load_state()
     managed_configs = state.get("managed_configs") or {}
 
@@ -1757,7 +1727,7 @@ def logout() -> int:
     }
     clear_state()
 
-    print_heading("Logout")
+    print_heading("Revert")
     print_kv("Workspace", state.get("workspace") or "none")
     for tool, spec in TOOL_SPECS.items():
         print_kv(f"{spec['display']} config", "restored" if results[tool] else "unchanged")
@@ -1777,17 +1747,16 @@ app.add_typer(configure_app, name="configure", help="Configure workspace and too
 @app.callback(invoke_without_command=True)
 def launch(
     ctx: typer.Context,
-    tool: Annotated[str, typer.Option("--tool", help="Tool to launch: codex, claude, or gemini.")] = DEFAULT_TOOL,
-    model: Annotated[str | None, typer.Option("--model", help="Model override for this session.")] = None,
+    agent: Annotated[str, typer.Option("--agent", help="Agent to launch: codex, claude, or gemini.")] = DEFAULT_TOOL,
 ) -> None:
     """Launch Codex, Claude Code, or Gemini CLI via Databricks."""
     if ctx.invoked_subcommand is not None:
         return
     try:
-        _tool = normalize_tool(tool)
+        _tool = normalize_tool(agent)
         ensure_bootstrap_dependencies(_tool)
         state = ensure_provider_state(_tool)
-        state, resolved_model = resolve_launch_model(_tool, state, model)
+        state, resolved_model = resolve_launch_model(_tool, state, None)
         state = configure_tool(_tool, state, resolved_model)
         print_section("Launching")
         print_kv("Tool", TOOL_SPECS[_tool]["display"])
@@ -1855,11 +1824,11 @@ def status_cmd() -> None:
         raise typer.Exit(1)
 
 
-@app.command("logout")
-def logout_cmd() -> None:
-    """Clear coding-gateway state and restore backed-up tool config files."""
+@app.command("revert")
+def revert_cmd() -> None:
+    """Clear coding-gateway state and restore backed-up agent config files."""
     try:
-        logout()
+        revert()
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1)
