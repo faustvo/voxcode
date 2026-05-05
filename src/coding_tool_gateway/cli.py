@@ -24,6 +24,7 @@ from urllib import request as urllib_request
 from urllib.parse import urlparse
 
 import questionary
+import tomlkit
 import typer
 from rich.console import Console
 from rich.panel import Panel
@@ -106,7 +107,6 @@ DEFAULT_TOOL = "codex"
 USAGE_BREAKDOWN_DAYS = 7
 USAGE_SUMMARY_DAYS = 30
 BUNDLE_VERSION = 1
-MANAGED_FILE_HEADER = "# Managed by coding-gateway. Run `coding-gateway revert` to restore the prior config.\n"
 
 _dry_run = False
 
@@ -294,7 +294,14 @@ def hydrate_state(state: dict) -> dict:
     managed_configs = hydrated.get("managed_configs")
     if not isinstance(managed_configs, dict):
         managed_configs = {}
-    hydrated["managed_configs"] = managed_configs
+    normalized: dict[str, dict] = {}
+    for tool, entry in managed_configs.items():
+        if isinstance(entry, dict):
+            keys = entry.get("keys") if isinstance(entry.get("keys"), list) else []
+            normalized[tool] = {"keys": keys}
+        elif entry:
+            normalized[tool] = {"keys": []}
+    hydrated["managed_configs"] = normalized
 
     workspace = hydrated.get("workspace")
     if workspace:
@@ -378,6 +385,85 @@ def write_json_file(path: Path, payload: dict) -> None:
         path.write_text(content, encoding="utf-8")
     except OSError as exc:
         raise RuntimeError(f"Failed to write config file: {path}") from exc
+
+
+def deep_merge_dict(base: dict, overlay: dict) -> dict:
+    """Recursively merge overlay into base; overlay wins for conflicting leaves.
+
+    Mutates and returns base. Nested dicts are merged; everything else is replaced.
+    """
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            deep_merge_dict(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def read_json_safe(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def read_toml_safe(path: Path) -> tomlkit.TOMLDocument:
+    if not path.exists():
+        return tomlkit.document()
+    try:
+        return tomlkit.parse(path.read_text(encoding="utf-8"))
+    except (OSError, tomlkit.exceptions.TOMLKitError):
+        return tomlkit.document()
+
+
+def write_toml_file(path: Path, doc: tomlkit.TOMLDocument) -> None:
+    content = tomlkit.dumps(doc)
+    if _dry_run:
+        console.print(f"\n[bold]\\[dry run] {path}[/bold]\n{content}")
+        return
+    ensure_parent_dir(path)
+    try:
+        path.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Failed to write config file: {path}") from exc
+
+
+def parse_dotenv(path: Path) -> dict[str, str]:
+    """Parse a simple KEY=VALUE / KEY=\"VALUE\" .env file, preserving insertion order.
+
+    Comments and blank lines are dropped on round-trip. Lines that don't look like
+    KEY=... are skipped.
+    """
+    if not path.exists():
+        return {}
+    env: dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            value = value[1:-1]
+        env[key] = value
+    return env
+
+
+def write_dotenv(path: Path, env: dict[str, str]) -> None:
+    content = "".join(f'{key}="{value}"\n' for key, value in env.items())
+    write_text_file(path, content)
 
 
 def install_databricks_cli() -> None:
@@ -1093,35 +1179,42 @@ def resolve_launch_model(
     return state, model
 
 
-def render_codex_config(workspace: str, use_ai_gateway_v2: bool) -> str:
+CODEX_MANAGED_KEYS: list[list[str]] = [
+    ["profile"],
+    ["profiles", "default", "model_provider"],
+    ["model_providers", "Databricks"],
+]
+
+
+def render_codex_overlay(workspace: str, use_ai_gateway_v2: bool) -> dict:
     auth_command = build_auth_shell_command(workspace)
     base_url = build_tool_base_url("codex", workspace, use_ai_gateway_v2)
-    return (
-        MANAGED_FILE_HEADER
-        + 'profile = "default"\n'
-        "\n"
-        "[profiles.default]\n"
-        'model_provider = "Databricks"\n'
-        "\n"
-        "[model_providers.Databricks]\n"
-        'name = "Databricks AI Gateway"\n'
-        f'base_url = "{base_url}"\n'
-        'wire_api = "responses"\n'
-        "\n"
-        "[model_providers.Databricks.auth]\n"
-        'command = "sh"\n'
-        f"args = [{json.dumps('-c')}, {json.dumps(auth_command)}]\n"
-        "timeout_ms = 5000\n"
-        "refresh_interval_ms = 1800000\n"
-    )
+    return {
+        "profile": "default",
+        "profiles": {"default": {"model_provider": "Databricks"}},
+        "model_providers": {
+            "Databricks": {
+                "name": "Databricks AI Gateway",
+                "base_url": base_url,
+                "wire_api": "responses",
+                "auth": {
+                    "command": "sh",
+                    "args": ["-c", auth_command],
+                    "timeout_ms": 5000,
+                    "refresh_interval_ms": 1800000,
+                },
+            }
+        },
+    }
 
 
-def render_claude_settings(
+def render_claude_overlay(
     workspace: str,
     use_ai_gateway_v2: bool,
     model: str,
     claude_models: dict[str, str] | None = None,
-) -> dict:
+) -> tuple[dict, list[list[str]]]:
+    """Return (overlay, managed_key_paths) for Claude settings.json."""
     base_url = build_tool_base_url("claude", workspace, use_ai_gateway_v2)
     env: dict[str, str] = {
         "ANTHROPIC_MODEL": model,
@@ -1137,38 +1230,54 @@ def render_claude_settings(
             env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = claude_models["sonnet"]
         if claude_models.get("haiku"):
             env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = claude_models["haiku"]
-    return {"apiKeyHelper": build_auth_shell_command(workspace), "env": env}
+    overlay = {"apiKeyHelper": build_auth_shell_command(workspace), "env": env}
+    keys: list[list[str]] = [["apiKeyHelper"]] + [["env", k] for k in env]
+    return overlay, keys
 
 
-def render_gemini_env(
+GEMINI_MANAGED_KEYS: list[str] = [
+    "GEMINI_MODEL",
+    "GOOGLE_GEMINI_BASE_URL",
+    "GEMINI_API_KEY_AUTH_MECHANISM",
+    "GEMINI_API_KEY",
+]
+
+
+def render_gemini_env_overlay(
     workspace: str,
     use_ai_gateway_v2: bool,
     model: str,
     token: str,
-) -> str:
+) -> dict[str, str]:
     base_url = build_tool_base_url("gemini", workspace, use_ai_gateway_v2)
-    return (
-        MANAGED_FILE_HEADER
-        + f'GEMINI_MODEL="{model}"\n'
-        f'GOOGLE_GEMINI_BASE_URL="{base_url}"\n'
-        'GEMINI_API_KEY_AUTH_MECHANISM="bearer"\n'
-        f'GEMINI_API_KEY="{token}"\n'
-    )
+    return {
+        "GEMINI_MODEL": model,
+        "GOOGLE_GEMINI_BASE_URL": base_url,
+        "GEMINI_API_KEY_AUTH_MECHANISM": "bearer",
+        "GEMINI_API_KEY": token,
+    }
 
 
-def render_opencode_config(
+OPENCODE_PROVIDER_KEYS: list[list[str]] = [
+    ["provider", "databricks-anthropic"],
+    ["provider", "databricks-google"],
+]
+
+
+def render_opencode_overlay(
     model: str,
     token: str,
     opencode_base_urls: dict[str, str],
     opencode_models: dict[str, list[str]],
-) -> dict:
-    """Generate opencode.json config with Anthropic and Google providers."""
+) -> tuple[dict, list[list[str]]]:
+    """Return (overlay, managed_key_paths) for opencode.json."""
     auth_headers = {"Authorization": f"Bearer {token}"}
 
     anthropic_models = opencode_models.get("anthropic") or []
     gemini_models = opencode_models.get("gemini") or []
 
     providers: dict = {}
+    keys: list[list[str]] = [["model"]]
     if anthropic_models:
         providers["databricks-anthropic"] = {
             "npm": "@ai-sdk/anthropic",
@@ -1179,6 +1288,7 @@ def render_opencode_config(
             },
             "models": {m: {} for m in anthropic_models},
         }
+        keys.append(["provider", "databricks-anthropic"])
     if gemini_models:
         providers["databricks-google"] = {
             "npm": "@ai-sdk/google",
@@ -1189,8 +1299,12 @@ def render_opencode_config(
             },
             "models": {m: {} for m in gemini_models},
         }
+        keys.append(["provider", "databricks-google"])
 
-    return {"provider": providers, "model": model}
+    overlay: dict = {"model": model}
+    if providers:
+        overlay["provider"] = providers
+    return overlay, keys
 
 
 def build_gemini_runtime_env(
@@ -1314,9 +1428,9 @@ def prompt_for_configuration(tool: str | None = None) -> str:
     return prompt_for_workspace(desc)
 
 
-def mark_tool_managed(state: dict, tool: str) -> dict:
+def mark_tool_managed(state: dict, tool: str, managed_keys: list) -> dict:
     managed_configs = dict(state.get("managed_configs") or {})
-    managed_configs[tool] = True
+    managed_configs[tool] = {"keys": list(managed_keys)}
     state["managed_configs"] = managed_configs
     state["last_tool"] = tool
     return state
@@ -1359,85 +1473,82 @@ def configure_shared_state(workspace: str) -> dict:
 
 def write_codex_tool_config(state: dict) -> dict:
     backup_existing_file(CODEX_CONFIG_PATH, CODEX_BACKUP_PATH)
-    write_text_file(
-        CODEX_CONFIG_PATH,
-        render_codex_config(
-            state["workspace"],
-            bool(state.get("use_ai_gateway_v2")),
-        ),
+    overlay = render_codex_overlay(
+        state["workspace"],
+        bool(state.get("use_ai_gateway_v2")),
     )
-    state = mark_tool_managed(state, "codex")
+    doc = read_toml_safe(CODEX_CONFIG_PATH)
+    deep_merge_dict(doc, overlay)
+    write_toml_file(CODEX_CONFIG_PATH, doc)
+    state = mark_tool_managed(state, "codex", CODEX_MANAGED_KEYS)
     save_state(state)
     return state
 
 
 def write_claude_tool_config(state: dict, model: str) -> dict:
     backup_existing_file(CLAUDE_SETTINGS_PATH, CLAUDE_BACKUP_PATH)
-    write_json_file(
-        CLAUDE_SETTINGS_PATH,
-        render_claude_settings(
-            state["workspace"],
-            bool(state.get("use_ai_gateway_v2")),
-            model,
-            state.get("claude_models") or {},
-        ),
+    overlay, managed_keys = render_claude_overlay(
+        state["workspace"],
+        bool(state.get("use_ai_gateway_v2")),
+        model,
+        state.get("claude_models") or {},
     )
-    state = mark_tool_managed(state, "claude")
+    existing = read_json_safe(CLAUDE_SETTINGS_PATH)
+    merged = deep_merge_dict(existing, overlay)
+    write_json_file(CLAUDE_SETTINGS_PATH, merged)
+    state = mark_tool_managed(state, "claude", managed_keys)
     save_state(state)
     return state
 
 
-def write_gemini_tool_config(state: dict, model: str) -> dict:
+def write_gemini_tool_config(state: dict, model: str, token: str | None = None) -> tuple[dict, str]:
     backup_existing_file(GEMINI_ENV_PATH, GEMINI_BACKUP_PATH)
-    token = get_databricks_token(state["workspace"])
-    write_text_file(
-        GEMINI_ENV_PATH,
-        render_gemini_env(
-            state["workspace"],
-            bool(state.get("use_ai_gateway_v2")),
-            model,
-            token,
-        ),
+    if token is None:
+        token = get_databricks_token(state["workspace"])
+    overlay = render_gemini_env_overlay(
+        state["workspace"],
+        bool(state.get("use_ai_gateway_v2")),
+        model,
+        token,
     )
-    state = mark_tool_managed(state, "gemini")
+    existing = parse_dotenv(GEMINI_ENV_PATH)
+    existing.update(overlay)
+    write_dotenv(GEMINI_ENV_PATH, existing)
+    state = mark_tool_managed(state, "gemini", GEMINI_MANAGED_KEYS)
     save_state(state)
-    return state
+    return state, token
 
 
-def write_opencode_tool_config(state: dict, model: str) -> dict:
+def write_opencode_tool_config(state: dict, model: str, token: str | None = None) -> tuple[dict, str]:
     backup_existing_file(OPENCODE_CONFIG_PATH, OPENCODE_BACKUP_PATH)
-    token = get_databricks_token(state["workspace"])
+    if token is None:
+        token = get_databricks_token(state["workspace"])
     opencode_base_urls = state.get("base_urls", {}).get("opencode") or build_opencode_base_urls(
         state["workspace"], bool(state.get("use_ai_gateway_v2"))
     )
-    write_json_file(
-        OPENCODE_CONFIG_PATH,
-        render_opencode_config(
-            model,
-            token,
-            opencode_base_urls,
-            state.get("opencode_models") or {},
-        ),
+    overlay, managed_keys = render_opencode_overlay(
+        model,
+        token,
+        opencode_base_urls,
+        state.get("opencode_models") or {},
     )
-    state = mark_tool_managed(state, "opencode")
+    existing = read_json_safe(OPENCODE_CONFIG_PATH)
+    providers = existing.get("provider")
+    if isinstance(providers, dict):
+        for stale in ("databricks-anthropic", "databricks-google"):
+            providers.pop(stale, None)
+    merged = deep_merge_dict(existing, overlay)
+    write_json_file(OPENCODE_CONFIG_PATH, merged)
+    state = mark_tool_managed(state, "opencode", managed_keys)
     save_state(state)
-    return state
+    return state, token
 
 
 def refresh_gemini_token_once(state: dict) -> str:
-    token = get_databricks_token(state["workspace"])
     model = default_model_for_tool("gemini", state)
     if not model:
         raise RuntimeError("No Gemini model is configured.")
-    write_text_file(
-        GEMINI_ENV_PATH,
-        render_gemini_env(
-            state["workspace"],
-            bool(state.get("use_ai_gateway_v2")),
-            model,
-            token,
-        ),
-    )
+    _, token = write_gemini_tool_config(state, model)
     return token
 
 
@@ -1450,23 +1561,10 @@ def refresh_gemini_env_forever(state: dict, stop_event: threading.Event) -> None
 
 
 def refresh_opencode_token_once(state: dict) -> str:
-    """Get a fresh token and rewrite opencode.json with it."""
-    token = get_databricks_token(state["workspace"])
     model = default_model_for_tool("opencode", state)
     if not model:
         raise RuntimeError("No OpenCode model is configured.")
-    opencode_base_urls = state.get("base_urls", {}).get("opencode") or build_opencode_base_urls(
-        state["workspace"], bool(state.get("use_ai_gateway_v2"))
-    )
-    write_json_file(
-        OPENCODE_CONFIG_PATH,
-        render_opencode_config(
-            model,
-            token,
-            opencode_base_urls,
-            state.get("opencode_models") or {},
-        ),
-    )
+    _, token = write_opencode_tool_config(state, model)
     return token
 
 
@@ -1488,11 +1586,13 @@ def configure_tool(tool: str, state: dict, model: str | None = None) -> dict:
     if tool == "gemini":
         if not model:
             raise RuntimeError("A Gemini model must be selected before configuration.")
-        return write_gemini_tool_config(state, model)
+        state, _ = write_gemini_tool_config(state, model)
+        return state
     if tool == "opencode":
         if not model:
             raise RuntimeError("An OpenCode model must be selected before configuration.")
-        return write_opencode_tool_config(state, model)
+        state, _ = write_opencode_tool_config(state, model)
+        return state
     raise RuntimeError(f"Unsupported tool '{tool}'.")
 
 
