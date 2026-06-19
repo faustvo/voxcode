@@ -436,7 +436,7 @@ def status() -> int:
     mcp_servers = state.get("mcp_servers") or []
     configured_tools = set(state.get("available_tools") or managed_configs.keys())
 
-    console.print(heading("ucode status"))
+    console.print(heading("voxcode status"))
     console.print(
         f"  {status_badge('Configured', 'ok') if workspace else status_badge('Not Configured', 'warn')}"
     )
@@ -468,7 +468,7 @@ def status() -> int:
             print_kv("MCP list command", str(MCP_CLIENTS[tool]["list_command"]))
             print_kv(
                 "MCP servers",
-                ", ".join(tool_mcp_servers) if tool_mcp_servers else "none saved by ucode",
+                ", ".join(tool_mcp_servers) if tool_mcp_servers else "none saved by voxcode",
             )
         print_kv("Config file", str(config_path) if config_path.exists() else "missing")
         console.print()
@@ -493,12 +493,12 @@ def status() -> int:
 
     print_heading("State")
     print_kv("State file", str(STATE_PATH) if STATE_PATH.exists() else "missing")
-    print_note("Use `ucode configure` to update workspace settings or configure new tools.")
+    print_note("Use `voxcode configure` to update workspace settings or configure new tools.")
     print_note(
-        "Use `ucode configure mcp` to add Databricks MCP servers to configured coding tools."
+        "Use `voxcode configure mcp` to add Databricks MCP servers to configured coding tools."
     )
-    print_note("Use `ucode configure tracing` to log coding sessions to an MLflow experiment.")
-    print_note("Use `ucode revert` to clear managed configs and restore prior files.")
+    print_note("Use `voxcode configure tracing` to log coding sessions to an MLflow experiment.")
+    print_note("Use `voxcode revert` to clear managed configs and restore prior files.")
     return 0
 
 
@@ -541,7 +541,7 @@ app = typer.Typer(
 configure_app = typer.Typer(add_completion=False, no_args_is_help=False)
 app.add_typer(configure_app, name="configure", help="Configure workspace and tool settings.")
 mcp_app = typer.Typer(add_completion=False, no_args_is_help=True)
-app.add_typer(mcp_app, name="mcp", help="MCP servers exposed by ucode.")
+app.add_typer(mcp_app, name="mcp", help="MCP servers exposed by voxcode.")
 
 
 @mcp_app.command("web-search")
@@ -604,7 +604,7 @@ def _launch_tool(tool_name: str, ctx: typer.Context) -> None:
             _auto_configure_tool(tool)
         state = ensure_provider_state(tool)
         # Re-fetch model lists on every launch so newly-added Databricks
-        # endpoints show up without a manual `ucode configure` (and so that
+        # endpoints show up without a manual `voxcode configure` (and so that
         # tools like pi which read multiple model bundles never run on
         # stale state from before a tool added a new bundle).
         state = configure_shared_state(
@@ -612,7 +612,7 @@ def _launch_tool(tool_name: str, ctx: typer.Context) -> None:
         )
         state, resolved_model = resolve_launch_model(tool, state, None)
         state = configure_tool(tool, state, resolved_model)
-        print_section(f"ucode with {TOOL_SPECS[tool]['display']}")
+        print_section(f"voxcode with {TOOL_SPECS[tool]['display']}")
         if resolved_model:
             print_kv("Model", resolved_model)
         if tool in ("gemini", "opencode", "copilot", "pi"):
@@ -806,7 +806,7 @@ def status_cmd() -> None:
 
 @app.command("revert")
 def revert_cmd() -> None:
-    """Clear ucode state and restore backed-up agent config files."""
+    """Clear voxcode state and restore backed-up agent config files."""
     try:
         revert()
     except RuntimeError as exc:
@@ -827,10 +827,10 @@ def usage_cmd() -> None:
 
 @app.command("upgrade")
 def upgrade_cmd() -> None:
-    """Upgrade ucode to the latest version from GitHub."""
+    """Upgrade voxcode to the latest version from GitHub."""
     import subprocess
 
-    git_url = "git+https://github.com/databricks/ucode"
+    git_url = "git+https://github.com/faustvo/ucode-vo"
     print_section("Upgrade")
     print_kv("Source", git_url)
     try:
@@ -844,7 +844,7 @@ def upgrade_cmd() -> None:
     except subprocess.CalledProcessError as exc:
         print_err(f"Upgrade failed (exit code {exc.returncode}).")
         raise typer.Exit(1) from None
-    print_success("ucode upgraded")
+    print_success("voxcode upgraded")
 
 
 def main() -> None:

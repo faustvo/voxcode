@@ -200,7 +200,7 @@ def ensure_tool_binary_available(tool: str) -> None:
     raise RuntimeError(
         f"{spec['display']} is not installed (`{binary}` was not found on PATH). "
         f"Install it with `npm install -g {spec['package']}` or run "
-        f"`ucode configure` to try automatic installation."
+        f"`voxcode configure` to try automatic installation."
     )
 
 

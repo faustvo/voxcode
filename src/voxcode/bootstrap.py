@@ -1,4 +1,4 @@
-"""Best-effort runtime/bootstrap installer for ucode dependencies."""
+"""Best-effort runtime/bootstrap installer for voxcode dependencies."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ def main() -> int:
         for tool in TOOL_SPECS:
             ensure_bootstrap_dependencies(tool)
     except RuntimeError as exc:
-        print_err(f"ucode bootstrap failed: {exc}")
+        print_err(f"voxcode bootstrap failed: {exc}")
         return 1
     return 0
 

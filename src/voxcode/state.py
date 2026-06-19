@@ -1,11 +1,11 @@
-"""Persistent state for ucode (per-workspace, versioned)."""
+"""Persistent state for voxcode (per-workspace, versioned)."""
 
 from __future__ import annotations
 
 import json
 
-from ucode.config_io import APP_DIR, is_dry_run
-from ucode.databricks import build_auth_shell_command, build_shared_base_urls
+from voxcode.config_io import APP_DIR, is_dry_run
+from voxcode.databricks import build_auth_shell_command, build_shared_base_urls
 
 STATE_PATH = APP_DIR / "state.json"
 STATE_VERSION = 3
@@ -57,7 +57,7 @@ def set_current_workspace(workspace: str | None) -> None:
     """Set ``current_workspace`` without touching the per-workspace blocks.
 
     Used by flows like ``configure tracing`` that operate on a non-current
-    workspace and must not silently change which workspace ``ucode launch``
+    workspace and must not silently change which workspace ``voxcode launch``
     targets afterwards."""
     if is_dry_run():
         return

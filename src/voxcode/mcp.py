@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import os
 import shutil
 import string
 import subprocess
@@ -24,9 +22,8 @@ from questionary.prompts.common import InquirerControl
 from questionary.question import Question
 from questionary.styles import merge_styles_default
 
-from ucode.agents import copilot, gemini, opencode
-from ucode.config_io import restore_file
-from ucode.databricks import (
+from voxcode.agents import opencode
+from voxcode.databricks import (
     apply_pat_environment,
     build_mcp_service_url,
     ensure_databricks_auth,
@@ -50,30 +47,10 @@ MCP_USER_SCOPE = "user"
 MCP_CLEANUP_SCOPES = ("local", "project", MCP_USER_SCOPE)
 MCP_PICKER_VISIBLE_ROWS = 10
 MCP_CLIENTS = {
-    "claude": {
-        "binary": "claude",
-        "display": "Claude Code",
-        "list_command": "claude mcp list",
-    },
-    "codex": {
-        "binary": "codex",
-        "display": "Codex",
-        "list_command": "codex mcp list",
-    },
-    "gemini": {
-        "binary": "gemini",
-        "display": "Gemini CLI",
-        "list_command": "gemini mcp list",
-    },
     "opencode": {
         "binary": "opencode",
         "display": "OpenCode",
         "list_command": "opencode mcp list",
-    },
-    "copilot": {
-        "binary": "copilot",
-        "display": "GitHub Copilot CLI",
-        "list_command": "copilot mcp list",
     },
 }
 EXTERNAL_MCP_SELECTION_PREFIX = "external:"
@@ -99,142 +76,6 @@ def build_mcp_http_entry(url: str) -> dict:
             "Authorization": f"Bearer ${{{MCP_AUTH_TOKEN_ENV_VAR}}}",
         },
     }
-
-
-def add_claude_mcp_server(name: str, entry: dict, scope: str = MCP_USER_SCOPE) -> None:
-    try:
-        subprocess.run(
-            ["claude", "mcp", "add-json", name, json.dumps(entry), "-s", scope],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(f"Failed to add MCP server '{name}' via claude CLI.") from exc
-
-
-def _is_missing_mcp_server_output(output: str) -> bool:
-    normalized = output.lower()
-    return (
-        "not found" in normalized
-        or "no mcp server" in normalized
-        or "no server named" in normalized
-        or ("mcp server found with name" in normalized and "no " in normalized)
-    )
-
-
-def remove_claude_mcp_server(name: str, scope: str) -> bool:
-    try:
-        subprocess.run(
-            ["claude", "mcp", "remove", name, "-s", scope],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        return True
-    except subprocess.CalledProcessError as exc:
-        output = f"{exc.stderr or ''}\n{exc.stdout or ''}"
-        if _is_missing_mcp_server_output(output):
-            return False
-        raise RuntimeError(f"Failed to remove MCP server '{name}' via claude CLI.") from exc
-
-
-def add_codex_mcp_server(name: str, url: str) -> None:
-    try:
-        subprocess.run(
-            [
-                "codex",
-                "mcp",
-                "add",
-                name,
-                "--url",
-                url,
-                "--bearer-token-env-var",
-                MCP_AUTH_TOKEN_ENV_VAR,
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(f"Failed to add MCP server '{name}' via codex CLI.") from exc
-
-
-def remove_codex_mcp_server(name: str) -> bool:
-    try:
-        result = subprocess.run(
-            ["codex", "mcp", "remove", name],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"Timed out removing MCP server '{name}' via codex CLI.") from exc
-
-    output = f"{result.stderr or ''}\n{result.stdout or ''}"
-    if _is_missing_mcp_server_output(output):
-        return False
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to remove MCP server '{name}' via codex CLI.")
-    return True
-
-
-def _gemini_cli_env() -> dict[str, str]:
-    # Pin GEMINI_CLI_HOME to the same directory the launcher.
-    env = os.environ.copy()
-    env["GEMINI_CLI_HOME"] = str(gemini.GEMINI_HOME_DIR)
-    return env
-
-
-def add_gemini_mcp_server(name: str, url: str) -> None:
-    try:
-        subprocess.run(
-            [
-                "gemini",
-                "mcp",
-                "add",
-                name,
-                url,
-                "--type",
-                "http",
-                "--scope",
-                MCP_USER_SCOPE,
-                "--header",
-                f"Authorization: Bearer ${{{MCP_AUTH_TOKEN_ENV_VAR}}}",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env=_gemini_cli_env(),
-        )
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(f"Failed to add MCP server '{name}' via gemini CLI.") from exc
-
-
-def remove_gemini_mcp_server(name: str) -> bool:
-    try:
-        result = subprocess.run(
-            ["gemini", "mcp", "remove", name, "--scope", MCP_USER_SCOPE],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env=_gemini_cli_env(),
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"Timed out removing MCP server '{name}' via gemini CLI.") from exc
-
-    output = f"{result.stderr or ''}\n{result.stdout or ''}"
-    if _is_missing_mcp_server_output(output):
-        return False
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to remove MCP server '{name}' via gemini CLI.")
-    return True
 
 
 def available_mcp_clients() -> list[str]:
@@ -916,14 +757,13 @@ def configure_mcp_command() -> int:
     installed_clients = available_mcp_clients()
     if not installed_clients:
         raise RuntimeError(
-            "No supported MCP clients are installed. Install Claude, Codex, Gemini, OpenCode, "
-            "or GitHub Copilot CLI."
+            "No supported MCP clients are installed. Install OpenCode CLI."
         )
     clients = configured_mcp_clients(state, installed_clients)
     if not clients:
         raise RuntimeError(
             "No configured MCP-capable coding agents are installed. Run `voxcode configure` "
-            "for Codex, Claude, Gemini, OpenCode, or GitHub Copilot CLI first."
+            "for OpenCode first."
         )
     configured_tools = set(state.get("available_tools") or [])
     missing_clients = [
